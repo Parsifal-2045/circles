@@ -306,6 +306,33 @@ var comparisonCache = {};
 var aggregatedComparisonCache = {}; // key -> { weights, total }
 var groupsPatternVersion = 0;       // increments whenever groups file recompiled
 var cachedComparisonTrees = {};     // cache full grouped trees per comparison dataset
+// Diff-view colour palette (https://arxiv.org/pdf/2107.02270), shared between the top
+// diff plot and the comparison-list colour swatches so the colours always match. Named
+// with a 'diff' prefix to avoid clobbering the global `colours` (list of colour schemes).
+const diffColours = [
+  'rgba(63, 144, 218, 0.6)',
+  'rgba(255, 169, 14, 0.6)',
+  'rgba(189, 31, 1, 0.6)',
+  'rgba(148, 164, 162, 0.6)',
+  'rgba(131, 45, 182, 0.6)',
+  'rgba(169, 107, 89, 0.6)',
+  'rgba(231, 99, 0, 0.6)',
+  'rgba(185, 172, 112, 0.6)',
+  'rgba(113, 117, 129, 0.6)',
+  'rgba(146, 218, 221, 0.6)'
+];
+const diffBorderColours = [
+  'rgba(63, 144, 218, 1)',
+  'rgba(255, 169, 14, 1)',
+  'rgba(189, 31, 1, 1)',
+  'rgba(148, 164, 162, 1)',
+  'rgba(131, 45, 182, 1)',
+  'rgba(169, 107, 89, 1)',
+  'rgba(231, 99, 0, 1)',
+  'rgba(185, 172, 112, 1)',
+  'rgba(113, 117, 129, 1)',
+  'rgba(146, 218, 221, 1)'
+];
 // table -> chart ordering sync
 var tableOrderSyncInstalled = false;
 var tableUserInitiatedSort = false;
@@ -852,10 +879,30 @@ function populateComparisonAddSelect(){
   if (sel.selectedIndex === -1) sel.selectedIndex = fallback;
 }
 
-function refreshComparisonList(){
+// Diff-view colour for a dataset position (0 = primary, i+1 = comparison i), matching the
+// colour assignment in plotTimingDifference.
+function diffColourFor(position){
+  return {
+    bg: diffColours[position % diffColours.length],
+    border: diffBorderColours[position % diffBorderColours.length]
+  };
+}
+function colourSwatchHTML(position){
+  var c = diffColourFor(position);
+  return '<span style="display:inline-block; width:12px; height:12px; border-radius:2px;'
+    + ' margin-right:6px; vertical-align:middle; flex:0 0 auto; background:'+c.bg+'; border:1px solid '+c.border+';"></span>';
+}
+
+// Build the comparison list, refresh the add-select and the shareable URL
+// In diff view each row also shows the colour the top diff plot assigns to
+// that dataset. Does NOT redraw the charts.
+function renderComparisonList(){
   var list = document.getElementById('comparison_list');
   if (!list) return;
   list.innerHTML = '';
+  // Colour swatches are only meaningful in diff view, where the top plot colours each
+  // dataset; the stacked view colours by group instead.
+  var showSwatches = isDiffView && comparisonDatasets.length > 0;
 
   // Always show the primary dataset first, clearly labeled and not removable, so it
   // is obvious at a glance which dataset the comparisons are being measured against.
@@ -868,17 +915,18 @@ function refreshComparisonList(){
     pdiv.style.gap='4px';
     pdiv.style.opacity='0.7';
     pdiv.innerHTML = '<span style="white-space:nowrap; overflow:hidden; max-width:1000px;" title="'+escapeHTML(primaryName)+'">'
-      + escapeHTML(primaryName) + ' <b>(primary)</b></span>';
+      + (showSwatches ? colourSwatchHTML(0) : '') + escapeHTML(primaryName) + ' <b>(primary)</b></span>';
     list.appendChild(pdiv);
   }
 
-  comparisonDatasets.forEach(function(c){
+  comparisonDatasets.forEach(function(c, i){
     var div=document.createElement('div');
     div.style.display='flex';
     div.style.justifyContent='space-between';
     div.style.alignItems='center';
     div.style.gap='4px';
-    div.innerHTML = '<span style="white-space:nowrap; overflow:hidden; max-width:1000px;" title="'+c.name+'">'+escapeHTML(c.name)+'</span>'
+    div.innerHTML = '<span style="white-space:nowrap; overflow:hidden; max-width:1000px;" title="'+c.name+'">'
+      + (showSwatches ? colourSwatchHTML(i+1) : '') + escapeHTML(c.name)+'</span>'
       +'<button type="button" style="padding:1px 4px;" onclick="removeComparisonDataset(\''+c.name.replace(/'/g,"\\'")+'\')">x</button>';
     list.appendChild(div);
   });
@@ -890,31 +938,49 @@ function refreshComparisonList(){
 
   populateComparisonAddSelect();
   syncComparisonURL();
-  // Re-render chart with updated comparisons
-  if (lastTopGroups) createPackagesSingleStackChart(lastTopGroups);
 }
 
-function clearComparisons() {
-  comparisonDatasets = [];
-  refreshComparisonList();
-  isDiffView = false;
-  var button = document.querySelector("button[onclick='toggleTimingDifference()']");
-  if (button) button.textContent = "Switch to diff view";
-  updateRelativeDiffLabelState();
-  if (lastTopGroups) {
+// Redraw the comparison charts in whichever view is currently active, so adding or
+// removing a dataset updates the diff plot in place instead of dropping back to stacked.
+function redrawComparisonView(){
+  if (!lastTopGroups) return;
+  if (isDiffView && comparisonDatasets.length){
+    plotTimingDifference();
+  } else {
     createPackagesBarChart(lastTopGroups);
+    createPackagesSingleStackChart(lastTopGroups);
     updatePackagesChartTitle();
   }
 }
 
-function removeComparisonDataset(name) {
-  comparisonDatasets = comparisonDatasets.filter(c => c.name !== name);
-  refreshComparisonList();
+// Leave diff view and restore the stacked-view controls (button label, focus selector,
+// relative-% label).
+function exitDiffView(){
   isDiffView = false;
   var button = document.querySelector("button[onclick='toggleTimingDifference()']");
   if (button) button.textContent = "Switch to diff view";
+  var middleGroupToggle = document.getElementById('middle_group_toggle');
+  if (middleGroupToggle) middleGroupToggle.style.display = "none";
   updateRelativeDiffLabelState();
-  if (lastTopGroups) createPackagesSingleStackChart(lastTopGroups);
+}
+
+function refreshComparisonList(){
+  renderComparisonList();
+  redrawComparisonView();
+}
+
+function clearComparisons() {
+  comparisonDatasets = [];
+  exitDiffView(); // nothing left to compare against
+  refreshComparisonList();
+}
+
+function removeComparisonDataset(name) {
+  comparisonDatasets = comparisonDatasets.filter(c => c.name !== name);
+  // Stay in diff view and just update it; only leave when nothing remains to compare
+  // against (diff view needs at least one comparison dataset).
+  if (isDiffView && !comparisonDatasets.length) exitDiffView();
+  refreshComparisonList();
 }
 
 function addComparisonDataset(){
@@ -923,10 +989,8 @@ function addComparisonDataset(){
   var name = sel.value;
   if (name === config.dataset) return;          // never compare the primary against itself
   if (comparisonDatasets.find(c=>c.name===name)) return;
-  isDiffView = false;
-  var button = document.querySelector("button[onclick='toggleTimingDifference()']");
-  if (button) button.textContent = "Switch to diff view";
-  updateRelativeDiffLabelState();
+  // Keep the current view (stacked or diff): once the dataset has loaded,
+  // refreshComparisonList -> redrawComparisonView updates whichever one is active.
   loadComparisonDataset(name);
 }
 
@@ -1081,7 +1145,8 @@ updateDataset = function(){
   // Keep existing comparisons across a primary change, but drop the new primary if it
   // is itself in the comparison list (a dataset cannot be compared against itself).
   comparisonDatasets = comparisonDatasets.filter(c => c.name !== config.dataset);
-  refreshComparisonList();
+  // List only; the imminent buildTablesAndCharts redraws the charts in the active view.
+  renderComparisonList();
 };
 
 var isDiffView = false;
@@ -1125,6 +1190,9 @@ function toggleTimingDifference() {
     }
   }
   updateRelativeDiffLabelState();
+  // Refresh the list so the per-dataset colour swatches appear/disappear with diff view
+  // (renderComparisonList does not touch the charts, so it won't clobber the diff plot).
+  renderComparisonList();
 }
 
 // Populate the middle-level group dropdown
@@ -1216,39 +1284,15 @@ function plotTimingDifference() {
     selectedGroup ? `${selectedGroupTitle} - Total ${current.title}: ${selectedGroupTotalValue.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 1 })} ${current.unit}` 
                   : "All Groups diff";
 
-  // Color palette from https://arxiv.org/pdf/2107.02270
-  var colors = [
-    'rgba(63, 144, 218, 0.6)', 
-    'rgba(255, 169, 14, 0.6)', 
-    'rgba(189, 31, 1, 0.6)', 
-    'rgba(148, 164, 162, 0.6)', 
-    'rgba(131, 45, 182, 0.6)',
-    'rgba(169, 107, 89, 0.6)',
-    'rgba(231, 99, 0, 0.6)',
-    'rgba(185, 172, 112, 0.6)',
-    'rgba(113, 117, 129, 0.6)',
-    'rgba(146, 218, 221, 0.6)'
-  ];
-  var borderColors = [
-    'rgba(63, 144, 218, 1)', 
-    'rgba(255, 169, 14, 1)', 
-    'rgba(189, 31, 1, 1)', 
-    'rgba(148, 164, 162, 1)', 
-    'rgba(131, 45, 182, 1)',
-    'rgba(169, 107, 89, 1)',
-    'rgba(231, 99, 0, 1)',
-    'rgba(185, 172, 112, 1)',
-    'rgba(113, 117, 129, 1)',
-    'rgba(146, 218, 221, 1)'
-  ];
+  // Diff-view colour palette is defined once at module scope (diffColours / diffBorderColours).
 
   // Primary dataset
   var primaryData = labels.map(label => primaryWeights[label] || 0);
   topDatasets.push({
     label: config.dataset.split('/').pop() || "Primary",
     data: primaryData,
-    backgroundColor: colors[0],
-    borderColor: borderColors[0],
+    backgroundColor: diffColours[0],
+    borderColor: diffBorderColours[0],
     borderWidth: 1
   });
 
@@ -1264,8 +1308,8 @@ function plotTimingDifference() {
     topDatasets.push({
       label: cd.name.split('/').pop(),
       data: comparisonData,
-      backgroundColor: colors[(index + 1) % colors.length],
-      borderColor: borderColors[(index + 1) % borderColors.length],
+      backgroundColor: diffColours[(index + 1) % diffColours.length],
+      borderColor: diffBorderColours[(index + 1) % diffBorderColours.length],
       borderWidth: 1
     });
 
@@ -1281,8 +1325,8 @@ function plotTimingDifference() {
     bottomDatasets.push({
       label: (isRelativeDiff ? '%Diff ' : 'Diff ') + `${cd.name.split('/').pop()} - ${config.dataset.split('/').pop()}`,
       data: differences,
-      backgroundColor: colors[(index + 1) % colors.length],
-      borderColor: borderColors[(index + 1) % borderColors.length],
+      backgroundColor: diffColours[(index + 1) % diffColours.length],
+      borderColor: diffBorderColours[(index + 1) % diffBorderColours.length],
       borderWidth: 1
     });
   });
