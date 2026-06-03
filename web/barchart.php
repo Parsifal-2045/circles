@@ -551,18 +551,44 @@ function createPackagesSingleStackChart(groups){
   if (packagesSingleStackChart) packagesSingleStackChart.destroy();
   var ctx = document.getElementById('packagesSingleStackChart').getContext('2d');
 
-  // ORDERING (primary dataset groups first)
-  
+  // ORDERING
+  // Alphabetical baseline, with two tweaks: groups whose name starts with a lower-case
+  // letter (e.g. "event setup") sort after the upper-case-initial ones, and "Unassigned"
+  // is always placed last. With comparisons: keep the groups whose value changed by
+  // <= 5% (relative to every comparison) at the bottom of the stack and move those that
+  // changed by more than 5% on top, so the actual differences stand out. Each part keeps
+  // the alphabetical ordering above.
+  var CHANGE_THRESHOLD = 0.05; // 5%
+  function groupChangedBeyondThreshold(label){
+    var p = primaryWeights[label] || 0;
+    for (var k=0;k<comparisonDatasets.length;k++){
+      var c = comparisonDatasets[k].weights[label] || 0;
+      var rel = (p === 0) ? (c === 0 ? 0 : Infinity) : Math.abs(c - p) / p;
+      if (rel > CHANGE_THRESHOLD) return true;
+    }
+    return false;
+  }
+  // Sort upper-case-initial groups before lower-case-initial ones, alphabetical within each.
+  function compareLabels(a,b){
+    var la = /^[a-z]/.test(a) ? 1 : 0;
+    var lb = /^[a-z]/.test(b) ? 1 : 0;
+    if (la !== lb) return la - lb;
+    return a.localeCompare(b);
+  }
   function orderSingleStackLabels(labels){
-    var priority = ['pixels','tracking','vertices','unassigned'];
-    var low = s=>s.toLowerCase();
-    var prioritized = [];
-    priority.forEach(p=>{
-      var idx = labels.findIndex(l=>low(l)===p);
-      if (idx>=0) prioritized.push(labels[idx]);
-    });
-    var rest = labels.filter(l=>!priority.includes(low(l))).sort((a,b)=>a.localeCompare(b));
-    return prioritized.concat(rest);
+    // "Unassigned" is pulled out and re-appended so it is always placed last.
+    var hasUnassigned = labels.indexOf("Unassigned") !== -1;
+    var sorted = labels.filter(l=>l!=="Unassigned").sort(compareLabels);
+    var ordered;
+    if (!comparisonDatasets.length){
+      ordered = sorted;
+    } else {
+      var changed = [], unchanged = [];
+      sorted.forEach(function(l){ (groupChangedBeyondThreshold(l) ? changed : unchanged).push(l); });
+      ordered = unchanged.concat(changed); // unchanged at the bottom of the stack, changed on top
+    }
+    if (hasUnassigned) ordered.push("Unassigned"); // always last
+    return ordered;
   }
 
   // Build union of top-level group labels across primary + comparisons
