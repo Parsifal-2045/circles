@@ -777,19 +777,52 @@ function populateComparisonAddSelect(){
   while (sel.options.length) sel.remove(0);
   var currentPrimary = config.dataset;
   datasets.forEach(function(d){
-    if (d === currentPrimary) return;
-    if (comparisonDatasets.find(c=>c.name===d)) return;
     var opt=document.createElement('option');
-    opt.value=d; opt.text=d;
+    opt.value=d;
+    opt.text=d;
+    // Show every dataset, but disable (gray out) the ones that cannot be added right
+    // now: the primary dataset and any already-selected comparison datasets.
+    if (d === currentPrimary){
+      opt.text = d + " (primary)";
+      opt.disabled = true;
+    } else if (comparisonDatasets.find(c=>c.name===d)){
+      opt.text = d + " (added)";
+      opt.disabled = true;
+    }
     sel.add(opt);
   });
-  if (sel.options.length) sel.selectedIndex=0;
+  // Restore the previous selection if it is still selectable, otherwise fall back to
+  // the first enabled option so a disabled/grayed entry is never left selected.
+  sel.selectedIndex = -1;
+  var fallback = -1;
+  for (var i=0;i<sel.options.length;i++){
+    if (sel.options[i].disabled) continue;
+    if (fallback === -1) fallback = i;
+    if (sel.options[i].value === keep){ sel.selectedIndex = i; break; }
+  }
+  if (sel.selectedIndex === -1) sel.selectedIndex = fallback;
 }
 
 function refreshComparisonList(){
   var list = document.getElementById('comparison_list');
   if (!list) return;
-  list.innerHTML = comparisonDatasets.length ? '' : '<em>None</em>';
+  list.innerHTML = '';
+
+  // Always show the primary dataset first, clearly labeled and not removable, so it
+  // is obvious at a glance which dataset the comparisons are being measured against.
+  var primaryName = config.local ? "local file" : config.dataset;
+  if (primaryName){
+    var pdiv = document.createElement('div');
+    pdiv.style.display='flex';
+    pdiv.style.justifyContent='space-between';
+    pdiv.style.alignItems='center';
+    pdiv.style.gap='4px';
+    pdiv.style.opacity='0.7';
+    pdiv.innerHTML = '<span style="white-space:nowrap; overflow:hidden; max-width:1000px;" title="'+escapeHTML(primaryName)+'">'
+      + escapeHTML(primaryName) + ' <b>(primary)</b></span>';
+    list.appendChild(pdiv);
+  }
+
   comparisonDatasets.forEach(function(c){
     var div=document.createElement('div');
     div.style.display='flex';
@@ -800,6 +833,12 @@ function refreshComparisonList(){
       +'<button type="button" style="padding:1px 4px;" onclick="removeComparisonDataset(\''+c.name.replace(/'/g,"\\'")+'\')">x</button>';
     list.appendChild(div);
   });
+
+  // Only "None" when there is genuinely nothing to show (no primary and no comparisons).
+  if (!list.children.length){
+    list.innerHTML = '<em>None</em>';
+  }
+
   populateComparisonAddSelect();
   // Re-render chart with updated comparisons
   if (lastTopGroups) createPackagesSingleStackChart(lastTopGroups);
@@ -832,6 +871,7 @@ function addComparisonDataset(){
   var sel = document.getElementById('comparison_add_select');
   if (!sel || !sel.value) return;
   var name = sel.value;
+  if (name === config.dataset) return;          // never compare the primary against itself
   if (comparisonDatasets.find(c=>c.name===name)) return;
   isDiffView = false;
   var button = document.querySelector("button[onclick='toggleTimingDifference()']");
