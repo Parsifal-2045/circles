@@ -265,6 +265,14 @@ var pendingURLComparisons = [];
   var c = new URL(window.location.href).searchParams.get("compare");
   if (c) pendingURLComparisons = c.split(",").map(s=>s.trim()).filter(Boolean);
 })();
+// Whether to restore diff view (?diff=1) from the URL; applied once a comparison loads.
+var pendingURLDiff = (function(){
+  var d = new URL(window.location.href).searchParams.get("diff");
+  return d === "1" || d === "true";
+})();
+// Focused group to restore from the URL (?focus=<group>); applied once it appears in the
+// focus dropdown (which needs the relevant comparison loaded). null = no focused group.
+var pendingURLFocus = new URL(window.location.href).searchParams.get("focus");
 
 // Hook compileGroups to advance pattern version for comparison cache invalidation.
 var groupsPatternVersion = 0;
@@ -454,11 +462,7 @@ function buildTablesAndCharts(){
   // the stacked view depending on the current mode.
   recomputeComparisons();
   if (isDiffView && comparisonDatasets.length){
-    // Keep the diff view; preserve the focused group only if it still exists.
-    var mg = document.getElementById('middle_group_select');
-    var prevFocus = mg ? mg.value : "";
-    populateMiddleGroupSelect();
-    if (mg) mg.value = lastTopGroups.some(g=>g.label===prevFocus) ? prevFocus : "";
+    // plotTimingDifference refreshes the focus dropdown (preserving the selection) itself.
     plotTimingDifference();
   } else {
     createPackagesBarChart(top);
@@ -964,6 +968,25 @@ function exitDiffView(){
   updateRelativeDiffLabelState();
 }
 
+// Enter diff view and set the stacked/diff toggle controls accordingly. Does not draw;
+// callers redraw (e.g. via plotTimingDifference or redrawComparisonView).
+function enterDiffView(){
+  isDiffView = true;
+  var button = document.querySelector("button[onclick='toggleTimingDifference()']");
+  if (button) button.textContent = "Switch to stacked view";
+  var middleGroupToggle = document.getElementById('middle_group_toggle');
+  if (middleGroupToggle) middleGroupToggle.style.display = "block";
+  updateRelativeDiffLabelState();
+}
+
+// Restore diff view from the URL (?diff=1) once at least one comparison has loaded
+// (diff view needs something to compare against). Applied at most once.
+function maybeApplyURLDiffView(){
+  if (!pendingURLDiff || !comparisonDatasets.length) return;
+  pendingURLDiff = false;
+  if (!isDiffView) enterDiffView();
+}
+
 function refreshComparisonList(){
   renderComparisonList();
   redrawComparisonView();
@@ -997,9 +1020,9 @@ function addComparisonDataset(){
 function loadComparisonDataset(name){
   if (comparisonCache[name]){
     processComparisonRaw(name, comparisonCache[name]);
-    return;
+    return Promise.resolve();
   }
-  fetch(config.data_name + '/' + name + '.json')
+  return fetch(config.data_name + '/' + name + '.json')
     .then(r=>r.json())
     .then(raw=>{
       comparisonCache[name]=raw;
@@ -1089,6 +1112,7 @@ function processComparisonRaw(name, raw){
   if (!current.compiled) return;
   var res = computeComparisonWeights(name, raw);
   comparisonDatasets.push({ name:name, weights:res.weights, total:res.total });
+  maybeApplyURLDiffView(); // enter diff view first if the URL requested it, so the redraw is diff
   refreshComparisonList();
 }
 
@@ -1106,11 +1130,14 @@ function recomputeComparisons(){
   });
 }
 
-// Mirror the current comparison selection into the page URL (without adding a history
-// entry)
+// Mirror the current comparison selection and view mode (diff/stacked) into the page URL
+// (without adding a history entry)
 function syncComparisonURL(){
   var names = comparisonDatasets.map(c=>c.name);
   config.compare = names.length ? names.join(",") : null;
+  config.diff = isDiffView ? 1 : null;
+  var focusSel = document.getElementById('middle_group_select');
+  config.focus = (isDiffView && focusSel && focusSel.value) ? focusSel.value : null;
   try {
     window.history.replaceState(config, document.title, convertConfigToURL(config));
   } catch(e){ /* ignore navigation errors */ }
@@ -1122,11 +1149,17 @@ var comparisonsFromURLApplied = false;
 function applyComparisonsFromURL(){
   if (comparisonsFromURLApplied) return;
   comparisonsFromURLApplied = true;
+  // Load sequentially so the comparison datasets keep the exact order given in the URL;
+  // parallel fetches can resolve out of order, which would reorder the list, the plotted
+  // datasets and their assigned colours.
+  var chain = Promise.resolve();
   pendingURLComparisons.forEach(function(name){
     if (name === config.dataset) return;                                          // skip the primary
     if (typeof datasets !== "undefined" && datasets.indexOf(name) === -1) return; // skip unknown datasets
-    if (comparisonDatasets.find(c=>c.name===name)) return;                        // skip duplicates
-    loadComparisonDataset(name);
+    chain = chain.then(function(){
+      if (comparisonDatasets.find(c=>c.name===name)) return;                      // skip duplicates
+      return loadComparisonDataset(name);
+    });
   });
 }
 
@@ -1172,24 +1205,17 @@ function updateRelativeDiffLabelState(){
 }
 
 function toggleTimingDifference() {
-  isDiffView = !isDiffView;
-  var button = document.querySelector("button[onclick='toggleTimingDifference()']");
-  var middleGroupToggle = document.getElementById('middle_group_toggle');
   if (isDiffView) {
-    button.textContent = "Switch to stacked view";
-    middleGroupToggle.style.display = "block";
-    populateMiddleGroupSelect();
-    plotTimingDifference();
-  } else {
-    button.textContent = "Switch to diff view";
-    middleGroupToggle.style.display = "none";
+    exitDiffView();
     if (lastTopGroups) {
       createPackagesBarChart(lastTopGroups);
       createPackagesSingleStackChart(lastTopGroups);
       updatePackagesChartTitle();
     }
+  } else {
+    enterDiffView();
+    plotTimingDifference();
   }
-  updateRelativeDiffLabelState();
   // Refresh the list so the per-dataset colour swatches appear/disappear with diff view
   // (renderComparisonList does not touch the charts, so it won't clobber the diff plot).
   renderComparisonList();
@@ -1199,14 +1225,43 @@ function toggleTimingDifference() {
 function populateMiddleGroupSelect() {
   var select = document.getElementById('middle_group_select');
   if (!select) return;
-  while (select.options.length > 1) select.remove(1); // Keep "All packages" option
+  var prev = select.value; // preserve the current focus across rebuilds
+  while (select.options.length > 1) select.remove(1); // Keep the "All groups" option
   if (!lastTopGroups) return;
-  lastTopGroups.forEach(group => {
+
+  // Primary groups first (in their current order), then groups that exist only in
+  // comparison datasets (alphabetical), so comparison-only groups can be focused too.
+  var seen = {};
+  var labels = [];
+  lastTopGroups.forEach(function(group){
+    if (!seen[group.label]) { seen[group.label] = true; labels.push(group.label); }
+  });
+  var extra = [];
+  comparisonDatasets.forEach(function(cd){
+    Object.keys(cd.weights).forEach(function(l){
+      if (!seen[l]) { seen[l] = true; extra.push(l); }
+    });
+  });
+  extra.sort(function(a,b){ return a.localeCompare(b); });
+  labels = labels.concat(extra);
+
+  labels.forEach(function(label){
     var opt = document.createElement('option');
-    opt.value = group.label;
-    opt.textContent = group.label;
+    opt.value = label;
+    opt.textContent = label;
     select.add(opt);
   });
+
+  // Restore the focus: honour a URL-requested focus as soon as the group it names is
+  // available (and the user has not picked something else); otherwise keep the previous
+  // selection. Fall back to "All groups" if the target no longer exists.
+  var target = prev;
+  if (pendingURLFocus !== null && prev === "" && labels.indexOf(pendingURLFocus) !== -1) {
+    target = pendingURLFocus;
+    pendingURLFocus = null; // applied once
+  }
+  var stillExists = Array.prototype.some.call(select.options, function(o){ return o.value === target; });
+  select.value = stillExists ? target : "";
 }
 
 // Update the diff view to focus on the selected middle-level group
@@ -1234,37 +1289,56 @@ function plotTimingDifference() {
   if (packagesSingleStackChart) packagesSingleStackChart.destroy();
 
   var primaryWeights = {};
+  // Keep the focus dropdown in sync with the current comparisons (preserving the current
+  // selection) so comparison-only groups are focusable.
+  populateMiddleGroupSelect();
   var selectedGroup = document.getElementById('middle_group_select').value;
   var selectedGroupTitle = "All Groups";
   var selectedGroupTotalValue = 0;
 
   if (selectedGroup) {
-    // Focus on module-level data (one layer deeper) for the selected package
+    // Focus on module-level data (one layer deeper) for the selected group. The group may
+    // exist only in comparison datasets, in which case the primary contributes no modules.
+    var primaryModuleWeights = {};
     var selectedGroupData = lastTopGroups.find(g => g.label === selectedGroup);
-    if (!selectedGroupData || !selectedGroupData.groups) {
-      alert("Selected package has no sub-groups.");
+    if (selectedGroupData && selectedGroupData.groups) {
+      selectedGroupData.groups.forEach(subGroup => {
+        if (subGroup.groups) {
+          subGroup.groups.forEach(module => {
+            primaryModuleWeights[module.label] = module.weight;
+          });
+        } else {
+          primaryModuleWeights[subGroup.label] = subGroup.weight;
+        }
+      });
+    }
+
+    // Rank modules by their largest weight across ALL configurations (primary plus every
+    // comparison) and keep the top 15, so the selection reflects every dataset, including
+    // modules that exist only in some of them.
+    var overallModuleWeights = Object.assign({}, primaryModuleWeights);
+    comparisonDatasets.forEach(function(cd){
+      var cmw = getComparisonModuleWeights(cd.name, selectedGroup);
+      Object.keys(cmw).forEach(function(l){
+        overallModuleWeights[l] = Math.max(overallModuleWeights[l] || 0, cmw[l]);
+      });
+    });
+    if (!Object.keys(overallModuleWeights).length) {
+      alert("Selected group has no module-level breakdown.");
       return;
     }
-    selectedGroupData.groups.forEach(subGroup => {
-      if (subGroup.groups) {
-        subGroup.groups.forEach(module => {
-          primaryWeights[module.label] = module.weight;
-        });
-      } else {
-        primaryWeights[subGroup.label] = subGroup.weight;
-      }
-    });
-
-    // Sort modules by weight and keep only the top 15
-    var sortedModules = Object.entries(primaryWeights)
+    var topModules = Object.entries(overallModuleWeights)
       .sort((a, b) => b[1] - a[1])
-    var topModules = sortedModules.slice(0, 15);
-    primaryWeights = Object.fromEntries(sortedModules);
+      .slice(0, 15)
+      .map(function(e){ return e[0]; });
 
-    // Update the selected group title and total value
+    // Keep the primary's values for those modules (0 where the primary lacks one).
+    primaryWeights = {};
+    topModules.forEach(function(l){ primaryWeights[l] = primaryModuleWeights[l] || 0; });
+
+    // Title shows the selected group's total in the primary dataset.
     selectedGroupTitle = selectedGroup;
-    selectedGroupTotalValue = Object.values(primaryWeights).reduce((a, b) => a + b, 0);
-    primaryWeights = Object.fromEntries(topModules);
+    selectedGroupTotalValue = Object.values(primaryModuleWeights).reduce((a, b) => a + b, 0);
   } else {
     // Use top-level groups without filtering
     lastTopGroups.forEach(g => {
@@ -1272,7 +1346,25 @@ function plotTimingDifference() {
     });
   }
 
-  var labels = Object.keys(primaryWeights);
+  // In the "All groups" view, show the union of the primary groups and any extra groups
+  // that exist only in a comparison dataset (their primary value is 0), so groups added by
+  // a comparison still appear. In the focused (module-level) view keep the primary modules.
+  var labels;
+  if (selectedGroup) {
+    labels = Object.keys(primaryWeights);
+  } else {
+    var primaryKeys = Object.keys(primaryWeights);
+    var seen = {};
+    primaryKeys.forEach(function(l){ seen[l] = true; });
+    var extraGroups = [];
+    comparisonDatasets.forEach(function(cd){
+      Object.keys(cd.weights).forEach(function(l){
+        if (!seen[l]) { seen[l] = true; extraGroups.push(l); }
+      });
+    });
+    extraGroups.sort(function(a,b){ return a.localeCompare(b); });
+    labels = primaryKeys.concat(extraGroups);
+  }
   var topDatasets = [];
   var bottomDatasets = [];
 
@@ -1417,6 +1509,9 @@ function plotTimingDifference() {
       }
     }
   });
+
+  // Mirror the resulting view state (including the focused group) into the URL.
+  syncComparisonURL();
 }
 
 // Helper to extract module-level weights for a selected top group from cached tree
