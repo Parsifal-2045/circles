@@ -36,6 +36,7 @@ Client-side (JavaScript):
   Utilities:
     - PNG export for each chart (white background compositing)
     - URL state mirrored via history API for deep-linking
+    - Comparison dataset status also reflected in URL for sharing
 -->
 <html lang="en">
 <head>
@@ -256,6 +257,14 @@ if (config.colours == null) config.colours = "default";
 if (config.groups == null) config.groups = "hlt";
 if (config.show_labels == null) config.show_labels = true;
 config.threshold = 0.;
+// Comparison datasets to restore from the URL (?compare=a,b,c)
+// Captured once here so it survives the list refreshes that happen while the
+// primary dataset loads; it is applied once the primary is ready.
+var pendingURLComparisons = [];
+(function(){
+  var c = new URL(window.location.href).searchParams.get("compare");
+  if (c) pendingURLComparisons = c.split(",").map(s=>s.trim()).filter(Boolean);
+})();
 
 // Hook compileGroups to advance pattern version for comparison cache invalidation.
 var groupsPatternVersion = 0;
@@ -412,12 +421,26 @@ function buildTablesAndCharts(){
   $('#selected').show();
   table.draw();
 
-  createPackagesBarChart(top);
   lastTopGroups = top.slice();
-  createPackagesSingleStackChart(top);
+  // Recompute the selected comparison datasets for the (possibly changed) metric /
+  // grouping so they survive configuration changes, then draw either the diff view or
+  // the stacked view depending on the current mode.
+  recomputeComparisons();
+  if (isDiffView && comparisonDatasets.length){
+    // Keep the diff view; preserve the focused group only if it still exists.
+    var mg = document.getElementById('middle_group_select');
+    var prevFocus = mg ? mg.value : "";
+    populateMiddleGroupSelect();
+    if (mg) mg.value = lastTopGroups.some(g=>g.label===prevFocus) ? prevFocus : "";
+    plotTimingDifference();
+  } else {
+    createPackagesBarChart(top);
+    createPackagesSingleStackChart(top);
+  }
   updatePackagesChartTitle();
   resizeChartHeights();
   populateComparisonAddSelect();
+  applyComparisonsFromURL();
 
   // One-time handlers to sync charts with user table sorting
   if (!tableOrderSyncInstalled){
@@ -840,6 +863,7 @@ function refreshComparisonList(){
   }
 
   populateComparisonAddSelect();
+  syncComparisonURL();
   // Re-render chart with updated comparisons
   if (lastTopGroups) createPackagesSingleStackChart(lastTopGroups);
 }
@@ -894,15 +918,12 @@ function loadComparisonDataset(name){
     .catch(e=>console.error("Failed to load comparison dataset "+name,e));
 }
 
-// Compute grouped weights for comparison dataset using current grouping/metric
-function processComparisonRaw(name, raw){
-  if (!current.compiled) return; 
+// Compute the grouped top-level weights for a comparison dataset under the current
+// grouping/metric, caching the result. Returns { weights, total } 
+function computeComparisonWeights(name, raw){
   var cacheKey = name+"|"+config.resource+"|v"+groupsPatternVersion+"|lbl"+(current.show_labels?1:0);
   if (aggregatedComparisonCache[cacheKey]){
-    var cached = aggregatedComparisonCache[cacheKey];
-    comparisonDatasets.push({ name:name, weights:cached.weights, total:cached.total });
-    refreshComparisonList();
-    return;
+    return aggregatedComparisonCache[cacheKey];
   }
   // Local aggregation to not modify current.data
   var localRoot = {
@@ -967,27 +988,62 @@ function processComparisonRaw(name, raw){
     }
   }
   var total = Object.values(weights).reduce((a,b)=>a+b,0);
-  aggregatedComparisonCache[cacheKey] = { weights:weights, total:total };
+  var result = { weights:weights, total:total };
+  aggregatedComparisonCache[cacheKey] = result;
   cachedComparisonTrees[cacheKey] = localRoot;
-  comparisonDatasets.push({ name:name, weights:weights, total:total });
+  return result;
+}
+
+// Add a comparison dataset entry (computing its weights) and refresh the list/charts.
+function processComparisonRaw(name, raw){
+  if (!current.compiled) return;
+  var res = computeComparisonWeights(name, raw);
+  comparisonDatasets.push({ name:name, weights:res.weights, total:res.total });
   refreshComparisonList();
 }
 
-// Clear comparisons when primary context changes
-function invalidateComparisons(){
-  clearComparisons();
-  populateComparisonAddSelect();
+// Recompute the weights of all currently-selected comparison datasets under the
+// current grouping/metric (e.g. after the user changes groups or metric). Updates
+// comparisonDatasets in place without touching the list/URL/charts; the caller
+// (buildTablesAndCharts) redraws afterwards.
+function recomputeComparisons(){
+  if (!current.compiled || !comparisonDatasets.length) return;
+  comparisonDatasets = comparisonDatasets.map(function(c){
+    var raw = comparisonCache[c.name];
+    if (!raw) return c; // raw not cached (should not happen) -> keep previous weights
+    var res = computeComparisonWeights(c.name, raw);
+    return { name:c.name, weights:res.weights, total:res.total };
+  });
 }
 
-// Hook into existing update triggers
-var _origUpdateMetrics = updateMetrics;
-updateMetrics = function(){ _origUpdateMetrics(); invalidateComparisons(); };
+// Mirror the current comparison selection into the page URL (without adding a history
+// entry)
+function syncComparisonURL(){
+  var names = comparisonDatasets.map(c=>c.name);
+  config.compare = names.length ? names.join(",") : null;
+  try {
+    window.history.replaceState(config, document.title, convertConfigToURL(config));
+  } catch(e){ /* ignore navigation errors */ }
+}
 
-var _origUpdateGroups = updateGroups;
-updateGroups = function(){ _origUpdateGroups(); invalidateComparisons(); };
+// One-time restore of comparison datasets named in the URL (?compare=a,b,c), run once
+// the primary dataset/metric/grouping are ready so their weights can be computed.
+var comparisonsFromURLApplied = false;
+function applyComparisonsFromURL(){
+  if (comparisonsFromURLApplied) return;
+  comparisonsFromURLApplied = true;
+  pendingURLComparisons.forEach(function(name){
+    if (name === config.dataset) return;                                          // skip the primary
+    if (typeof datasets !== "undefined" && datasets.indexOf(name) === -1) return; // skip unknown datasets
+    if (comparisonDatasets.find(c=>c.name===name)) return;                        // skip duplicates
+    loadComparisonDataset(name);
+  });
+}
 
-var _origUpdateColours = updateColours;
-updateColours = function(){ _origUpdateColours(); invalidateComparisons(); };
+// The selected comparison datasets are kept across metric / grouping / colour changes:
+// their weights are recomputed for the new configuration in buildTablesAndCharts, so
+// there is no need to wipe the list on those actions. Comparisons are only removed
+// manually, via the per-row "x" or the "Clear" button.
 
 var _origUpdateDataset = updateDataset;
 updateDataset = function(){
@@ -996,7 +1052,10 @@ updateDataset = function(){
   var table = $('#properties').DataTable();
   table.order([]).draw();
   _origUpdateDataset();
-  invalidateComparisons();
+  // Keep existing comparisons across a primary change, but drop the new primary if it
+  // is itself in the comparison list (a dataset cannot be compared against itself).
+  comparisonDatasets = comparisonDatasets.filter(c => c.name !== config.dataset);
+  refreshComparisonList();
 };
 
 var isDiffView = false;
